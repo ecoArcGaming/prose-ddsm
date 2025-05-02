@@ -319,7 +319,18 @@ def diffusion_factory(
     """
     Generate multivariate Jacobi diffusion samples and scores
     by sampling from noise factory for k-1 Jacobi diffusion processes.
+    
+    x: [B, L, K]
+    time_ind: [B]
+    noise_factory_one, noise_factory_zero: [noise_factory_size, n_time_steps, K-1]
+    noise_factory_one_loggrad, noise_factory_zero_loggrad: [noise_factory_size, n_time_steps, K-1]
+    alpha: [K-1]
+    beta: [K-1]
     """
+    # print(x.shape, time_ind.shape, noise_factory_one.shape, noise_factory_zero.shape,
+    #     noise_factory_one_loggrad.shape, noise_factory_zero_loggrad.shape , alpha.shape, beta.shape)
+    # breakpoint()
+    #
     time_ind = time_ind[(...,) + (None,) * (x.ndim - 2)].expand(x.shape[:-1])
     K = x.shape[-1]
     if alpha is None:

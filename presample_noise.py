@@ -12,7 +12,7 @@ def parse_args():
                         help="Number of the different samples pre generated (default = 100000)",
                         default=100000) 
     parser.add_argument("-c", "--num_cat", type=int,
-                        help="Number of categories", required=True) 
+                        help="Number of categories", default=7) 
     parser.add_argument("-t", '--num_time_steps', type=int,
                         help="Number of time steps between <min_time> and <max_time> (default = 400)",
                         default=400) 

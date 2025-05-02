@@ -13,48 +13,82 @@ from torch.optim import Adam
 import os
 import numpy as np
 
-device = 'cuda'
-model = DiT(n_vocab=8).to(device)
-xs =  Tensor([[0, 1, 2, 3, 0, 1, 2, 2, 3, 0, 4, 5]]).long().to(device)
-segment_sizes = Tensor([[4, 5, 3]]).to(device)
-time = Tensor([1]).to(device)
-out = model(xs, segment_sizes, time)
-print(xs.shape)
-print(out.shape)
-breakpoint()
+# device = 'cuda'
+# model = DiT(n_vocab=8).to(device)
+# xs =  Tensor([[0, 1, 2, 3, 0, 1, 2, 2, 3, 0, 4, 5]]).long().to(device)
+# segment_sizes = Tensor([[4, 5, 3]]).to(device)
+# time = Tensor([1]).to(device)
+# out = model(xs, segment_sizes, time)
+# print(xs.shape)
+# print(out.shape)
+# breakpoint()
 
 class ModelParameters:
     hits_path = 'data/hits.pkl'
     query_path = 'data/query.pkl'
     weights_file = '/home/erik/ddsm/steps400.cat2.time4.0.samples10000.pth'
     device = 'cuda'
-    batch_size = 256
-    num_workers = 4
+    batch_size = 2
+    num_workers = 1
     n_time_steps = 400
     random_order = False
     speed_balanced = True
-    ncat = 6
+    ncat = 7
     num_epochs = 200
     lr = 5e-4
-    max_len = 16000
+    max_len = 8000
+    padding_idx = -100
 
 config = ModelParameters()
 alphabet = ATCG()
 
-with open(config.hits_path, "rb") as f:
-    hits = pickle.load(f)
+# with open(config.hits_path, "rb") as f:
+#     hits = pickle.load(f)
 
-with open(config.query_path, "rb") as f:
-    query = pickle.load(f)
+# with open(config.query_path, "rb") as f:
+#     query = pickle.load(f)
 
-dataset = PromoterDataset(sequences=hits,
-                          queries=query,
+h = {
+        "OXKSZ": {"ACAGAGTAACTGC", "CACGCAAGCGACTA", "GGGCGGGTAGTACCC"},
+        "GHXGF": {"AAAATGGTCTGTC", "AATAAGTGAG", "CGCGACGCCATAGTT"},
+        "XSVNO": {"CCGATCCCGCCCGC", "GCGGGCCGGCATGCC", "TTTAGTTGTGTT"},
+        "LPTSW": {"ATTGCTGGACA", "GCAGTGCCAGTTTC", "GTCATCGTGCACAT"},
+        "SAPJM": {"AGAGGTACCC", "CGGGTGAAATT", "CTGGTCACGAGTT"},
+        "KNGBV": {"AGCACGCACG", "GAGCGTATCGCAGC"},
+        "YTWYS": {"AATGCAACTGGTT", "ATGAAATTATT", "GTACAGACCC"},
+        "IMXVE": {
+            "TAGTGCAACC",
+            "TGAGACGGACGAT",
+        },
+        "QDKFG": {"CAGGTTTGGCCTGT", "CCCAGTTACCA", "GTTTGACTGC"},
+        "GDLYH": {"AACGACAAGCATG", "TACCCGAGTGTAT", "TGGGATCTCA"},
+        "XQIRL": {"CACGTGGCGCCGCTT", "CCGTTTTATTG", "GTCCTTACATGCCCC"},
+        "BSKUP": {"GAGCCTCTTGCG", "GAGCGTATCGCAGC"},
+    }
+q = {
+    "OXKSZ": "ACAGAGTAACTGC",
+    "GHXGF": "AAAATGGTCTGTC",
+    "XSVNO": "CCGATCCCGCCCGC",
+    "LPTSW": "ATTGCTGGACA",
+    "SAPJM": "CTGGTCACGAGTT",
+    "KNGBV": "CGGGTAGTTGCGAAC",
+    "YTWYS": "GTACAGACCC",
+    "IMXVE": "TAGTGCAACC",
+    "QDKFG": "GTTTGACTGC",
+    "GDLYH": "TGGGATCTCA",
+    "XQIRL": "GTCCTTACATGCCCC",
+    "BSKUP": "TCGACGAATG",
+}
+
+dataset = PromoterDataset(sequences=h,
+                          queries=q,
                           alphabet=alphabet,
                           max_length = config.max_len)
 dataloader = DataLoader(dataset, 
                         batch_size=config.batch_size, 
                         shuffle=True, 
-                        num_workers=config.num_workers)
+                        num_workers=config.num_workers,
+                        collate_fn=dataset.padded_collate_packed)
 
 v_one, v_zero, v_one_loggrad, v_zero_loggrad, timepoints = torch.load(config.weights_file)
 v_one = v_one.cpu()
@@ -64,7 +98,7 @@ v_zero_loggrad = v_zero_loggrad.cpu()
 timepoints = timepoints.cpu()
 alpha = torch.ones(config.ncat - 1).float()
 beta =  torch.arange(config.ncat - 1, 0, -1).float()
-device = "cuda"
+device = "cpu"
 sb = UnitStickBreakingTransform()
 
 print("--- Stage 1: Calculating Time-Dependent Weights ---")
@@ -72,48 +106,54 @@ time_dependent_cums = torch.zeros(config.n_time_steps).to(device)
 time_dependent_counts = torch.zeros(config.n_time_steps).to(device)
 num_items_stage1 = 0
 
-with torch.no_grad(): # No gradients needed for weight calculation
-    for batch in tqdm.tqdm(dataloader, desc="Stage 1 Weights"):
-        tokens = batch["tokens"].to(device) # Shape: [B, L]
-        B, L = tokens.shape
+# with torch.no_grad(): # No gradients needed for weight calculation
+for batch in tqdm.tqdm(dataloader, desc="Stage 1 Weights"):
+    tokens = batch["tokens"].to(device) # Shape: [B, L]
+    # print(tokens.shape) # torch.Size([2, 7992])
+    B, L = tokens.shape
+    
+    padding_mask = (tokens == config.padding_idx) # Shape [B, L], True where padded
+    tokens_safe = tokens.clone()
+    tokens_safe[padding_mask] = 0 
 
-        # Convert tokens to one-hot encoding
-        x_one_hot = F.one_hot(tokens, num_classes=config.n_vocab).float() # Shape: [B, L, V]
+    # Convert tokens to one-hot encoding
+    x_one_hot = F.one_hot(tokens_safe, num_classes=config.ncat).float() # Shape: [B, L, V]
+    x_one_hot.masked_fill_(padding_mask.unsqueeze(-1), 0.0)
+    x_one_hot = x_one_hot[..., :config.ncat]
+    # Sample random time indices
+    random_t_idx = torch.randint(0, config.n_time_steps, (B,), device=device) # Discrete indices
+    print(x_one_hot.shape, random_t_idx.shape, alpha.shape, v_zero.shape) 
+    # torch.Size([2, 7998, 7]) torch.Size([2]) torch.Size([6]),  torch.Size([10000, 400, 1])
+    
+    perturbed_x, perturbed_x_grad = diffusion_factory(
+        x_one_hot.cpu(), random_t_idx.cpu(), v_one, v_zero, v_one_loggrad, v_zero_loggrad, alpha, beta
+    )
+    perturbed_x = perturbed_x.to(device)
+    perturbed_x_grad = perturbed_x_grad.to(device)
 
-        # Sample random time indices
-        random_t_idx = torch.randint(0, config.n_time_steps, (B,), device=device) # Discrete indices
+    # Calculate contribution to weights (using stick-breaking space)
+    if config.random_order:
+            raise NotImplementedError("Random order logic needs careful implementation matching gx_to_gv")
+    else:
+        perturbed_v = sb._inverse(perturbed_x, prevent_nan=True) # Shape [B, L, V-1]
+        grad_v = gx_to_gv(perturbed_x_grad, perturbed_x) # Shape [B, L, V-1]
 
-        # Apply forward diffusion
-        # Note: Pass schedules from CPU tensors loaded earlier
-        perturbed_x, perturbed_x_grad = diffusion_factory(
-            x_one_hot.cpu(), random_t_idx.cpu(), v_one, v_zero, v_one_loggrad, v_zero_loggrad, alpha, beta
-        )
-        perturbed_x = perturbed_x.to(device)
-        perturbed_x_grad = perturbed_x_grad.to(device)
+    # Weighting factor (from original script)
+    if config.speed_balanced:
+        s_weights = 2 / (torch.ones(config.ncat - 1, device=device) + torch.arange(config.ncat - 1, 0, -1, device=device).float())
+    else:
+        s_weights = torch.ones(config.ncat - 1, device=device)
 
-        # Calculate contribution to weights (using stick-breaking space)
-        if config.random_order:
-                raise NotImplementedError("Random order logic needs careful implementation matching gx_to_gv")
-        else:
-            perturbed_v = sb._inverse(perturbed_x, prevent_nan=True) # Shape [B, L, V-1]
-            grad_v = gx_to_gv(perturbed_x_grad, perturbed_x) # Shape [B, L, V-1]
+    # Calculate squared magnitude in v-space, weighted
+    variance_term = (perturbed_v * (1 - perturbed_v) * s_weights * grad_v**2) # Shape [B, L, V-1]
 
-        # Weighting factor (from original script)
-        if config.speed_balanced:
-            s_weights = 2 / (torch.ones(config.ncat - 1, device=device) + torch.arange(config.ncat - 1, 0, -1, device=device).float())
-        else:
-            s_weights = torch.ones(config.ncat - 1, device=device)
+    # Average over sequence length and V-1 dimensions, sum contributions per time index
+    batch_variances = variance_term.sum(dim=[1, 2]) # Sum over L and V-1 -> Shape [B]
 
-        # Calculate squared magnitude in v-space, weighted
-        variance_term = (perturbed_v * (1 - perturbed_v) * s_weights * grad_v**2) # Shape [B, L, V-1]
-
-        # Average over sequence length and V-1 dimensions, sum contributions per time index
-        batch_variances = variance_term.sum(dim=[1, 2]) # Sum over L and V-1 -> Shape [B]
-
-        # Use scatter_add_ to sum variances for each time index present in the batch
-        time_dependent_cums.scatter_add_(0, random_t_idx, batch_variances)
-        time_dependent_counts.scatter_add_(0, random_t_idx, torch.ones_like(random_t_idx, dtype=torch.float))
-        num_items_stage1 += B
+    # Use scatter_add_ to sum variances for each time index present in the batch
+    time_dependent_cums.scatter_add_(0, random_t_idx, batch_variances)
+    time_dependent_counts.scatter_add_(0, random_t_idx, torch.ones_like(random_t_idx, dtype=torch.float))
+    num_items_stage1 += B
 
 # Avoid division by zero for time steps that were not sampled
 time_dependent_counts[time_dependent_counts == 0] = 1

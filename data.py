@@ -550,7 +550,7 @@ class PromoterDataset(Dataset):
             "labels": labels_tensor,
         }
 
-        collated_batch = self._to_cuda(collated_batch)
+        # collated_batch = self._to_cuda(collated_batch)
         return collated_batch
 
     def __len__(self):
