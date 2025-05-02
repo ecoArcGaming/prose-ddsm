@@ -38,6 +38,7 @@ class ModelParameters:
     lr = 5e-4
     max_len = 8000
     padding_idx = -100
+    output_dir = '.'
 
 config = ModelParameters()
 alphabet = ATCG()
@@ -91,14 +92,14 @@ dataloader = DataLoader(dataset,
                         collate_fn=dataset.padded_collate_packed)
 
 v_one, v_zero, v_one_loggrad, v_zero_loggrad, timepoints = torch.load(config.weights_file)
-v_one = v_one.cpu()
-v_zero = v_zero.cpu()
-v_one_loggrad = v_one_loggrad.cpu()
-v_zero_loggrad = v_zero_loggrad.cpu()
+v_one = v_one.cpu().expand(-1, -1,config.ncat - 1 )
+v_zero = v_zero.cpu().expand(-1, -1,config.ncat - 1 )
+v_one_loggrad = v_one_loggrad.cpu().expand(-1, -1,config.ncat - 1 )
+v_zero_loggrad = v_zero_loggrad.cpu().expand(-1, -1,config.ncat - 1 )
 timepoints = timepoints.cpu()
 alpha = torch.ones(config.ncat - 1).float()
 beta =  torch.arange(config.ncat - 1, 0, -1).float()
-device = "cpu"
+device = "cuda"
 sb = UnitStickBreakingTransform()
 
 print("--- Stage 1: Calculating Time-Dependent Weights ---")
@@ -122,7 +123,7 @@ for batch in tqdm.tqdm(dataloader, desc="Stage 1 Weights"):
     x_one_hot = x_one_hot[..., :config.ncat]
     # Sample random time indices
     random_t_idx = torch.randint(0, config.n_time_steps, (B,), device=device) # Discrete indices
-    print(x_one_hot.shape, random_t_idx.shape, alpha.shape, v_zero.shape) 
+    # print(x_one_hot.shape, random_t_idx.shape, alpha.shape, v_zero.shape) 
     # torch.Size([2, 7998, 7]) torch.Size([2]) torch.Size([6]),  torch.Size([10000, 400, 1])
     
     perturbed_x, perturbed_x_grad = diffusion_factory(
@@ -175,13 +176,13 @@ plt.close()
 # --- Stage 2: Training the Score Model ---
 print("--- Stage 2: Training DiT Score Model ---")
 # Instantiate your actual DiT model here
-score_model = DiT(config)
+score_model = DiT(config.ncat)
 # Apply DataParallel if using multiple GPUs
 # score_model = nn.DataParallel(score_model)
 score_model = score_model.to(device)
 
 optimizer = Adam(score_model.parameters(), lr=config.lr)
-
+timepoints = timepoints.to(device)
 tqdm_epoch = tqdm.trange(config.num_epochs, desc="Epochs")
 for epoch in tqdm_epoch:
     score_model.train()
@@ -195,9 +196,9 @@ for epoch in tqdm_epoch:
         # labels = batch["labels"].to(device) # Labels might not be needed for DDSM training itself
         B, L = tokens.shape
 
-        # Convert tokens to one-hot encoding
-        x_one_hot = F.one_hot(tokens, num_classes=config.n_vocab).float() # Shape: [B, L, V]
-
+        x_one_hot = F.one_hot(tokens_safe, num_classes=config.ncat).float() # Shape: [B, L, V]
+        x_one_hot.masked_fill_(padding_mask.unsqueeze(-1), 0.0)
+        x_one_hot = x_one_hot[..., :config.ncat]
         # Sample random time indices (potentially importance sampled)
         random_t_idx = torch.randint(0, config.n_time_steps, (B,), device=device) # Discrete indices
 
@@ -211,6 +212,7 @@ for epoch in tqdm_epoch:
         # Get continuous time points for the model
         random_timepoints = timepoints[random_t_idx].to(device) # Shape [B]
 
+        # torch.Size([2, 7998, 7]) torch.Size([2, 574]) torch.Size([2])
         # --- Model Forward Pass ---
         # Pass the noisy distribution, segment sizes, and continuous time
         predicted_score = score_model(perturbed_x, segment_sizes, random_timepoints) # Output: [B, L, V]

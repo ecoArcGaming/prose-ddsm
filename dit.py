@@ -36,11 +36,48 @@ class AdaLayerNorm(nn.Module):
         self.scale_shift.weight.data.zero_()
         self.scale_shift.bias.data.zero_()
         
-    def forward(self, x, timestep_embedding):
-        scale, shift = self.scale_shift(timestep_embedding).chunk(2, dim=1)
-        x = self.norm(x)
-        return x * (1 + scale) + shift
-        
+    def forward(self, x: Tensor, timestep_embedding: Tensor, seqs_cu_seqlens: Tensor) -> Tensor:
+        """
+        Applies Adaptive Layer Normalization using cumulative sequence lengths.
+
+        Args:
+            x: Input tensor (packed sequence). Shape: [packed_len, dim].
+            timestep_embedding: Timestep embedding for the batch.
+                                Shape: [B, time_embed_dim], where B is the batch size.
+            seqs_cu_seqlens: Cumulative sequence lengths for the batch.
+                             Shape: [B+1]. Should start with 0 and end with packed_len.
+                             Must be on the same device as x.
+
+        Returns:
+            Normalized and scaled/shifted tensor. Shape: [packed_len, dim].
+        """
+      
+
+        # 1. Calculate scale and shift factors for the entire batch
+        # scale_shift_params has shape [B, dim * 2]
+        scale_shift_params = self.scale_shift(timestep_embedding)
+        # scale and shift both have shape [B, dim]
+        scale, shift = scale_shift_params.chunk(2, dim=1)
+
+        # 2. Calculate lengths of each sequence in the batch
+        # lengths will have shape [B]
+        lengths = seqs_cu_seqlens[1:] - seqs_cu_seqlens[:-1] # Equivalent to seqs_cu_seqlens.diff()
+
+        # 3. Expand scale and shift to match the packed sequence length
+        # Use repeat_interleave to repeat each batch item's scale/shift 'length' times
+        # scale_gathered and shift_gathered will have shape [packed_len, dim]
+        scale_gathered = scale.repeat_interleave(lengths, dim=0)
+        shift_gathered = shift.repeat_interleave(lengths, dim=0)
+
+        # 4. Apply Layer Normalization to the input x
+        # x_norm has shape [packed_len, dim]
+        x_norm = self.norm(x)
+
+        # 5. Apply the gathered scale and shift factors
+        # Using the formula: output = x_norm * (1 + scale) + shift
+        output = x_norm * (1 + scale_gathered) + shift_gathered
+
+        return output
 
 class DiTTieredTransformerEncoderLayer(nn.Module):
     """
@@ -210,7 +247,7 @@ class DiTTieredTransformerEncoderLayer(nn.Module):
         # apply the self attention layer on the sequences independently
         x_norm = copy.copy(x)
        
-        x_norm.x = self.norm1(x.x, timestep_embedding)
+        x_norm.x = self.norm1(x.x, timestep_embedding, seqs_cu_seqlens)
         # at the next line, I get the error forward_padded() takes from 2 to 7 positional arguments but 8 were given
         x2, attn_self = self.self_attn(
             x_norm,
@@ -227,7 +264,7 @@ class DiTTieredTransformerEncoderLayer(nn.Module):
             assert patch_size == 0
             assert segment_sizes_cpu is not None
             x_norm.x = x.x[x.cu_seqlens_cpu[:-1].long()]
-            x_norm.x = self.norm2(x_norm.x, timestep_embedding)
+            x_norm.x = self.norm2(x_norm.x, timestep_embedding, seqs_cu_seqlens)
             n_seqs = (segment_sizes_cpu > 0).long().sum(dim=1)
             x_norm.cu_seqlens = (
                 F.pad(n_seqs.cumsum(dim=0), (1, 0))
@@ -245,7 +282,7 @@ class DiTTieredTransformerEncoderLayer(nn.Module):
             assert not x_norm.to_paddedable
             assert src_key_padding_mask is None
         else:
-            x_norm.x = self.norm2(x.x, timestep_embedding)
+            x_norm.x = self.norm2(x.x, timestep_embedding, seqs_cu_seqlens)
             x_norm.cu_seqlens = seqs_cu_seqlens  # "reshape" the packed sequences
             if seqs_cu_seqlens_cpu is not None:
                 x_norm.cu_seqlens_cpu = seqs_cu_seqlens_cpu
@@ -285,7 +322,7 @@ class DiTTieredTransformerEncoderLayer(nn.Module):
         x = copy.copy(x)
         x.x = x.x + self.dropout2(x2.x)
 
-        x2 = self.linear2(self.dropout(gelu(self.linear1(self.norm3(x.x, timestep_embedding)))))
+        x2 = self.linear2(self.dropout(gelu(self.linear1(self.norm3(x.x, timestep_embedding, seqs_cu_seqlens)))))
         x.x = x.x + self.dropout3(x2)
 
         if return_attention:
@@ -611,6 +648,8 @@ class DiT(PoET):
                                    nn.Linear(time_embed_dim, time_embed_dim))
         if norm:
             self.norm = AdaLayerNorm(hidden_dim, time_embed_dim)
+
+        self.project_pt = nn.Linear(n_vocab, hidden_dim)
     
     def forward(self, xs: torch.Tensor, segment_sizes: torch.Tensor, time: torch.Tensor) -> torch.Tensor:
         """
@@ -640,13 +679,12 @@ class DiT(PoET):
           the vocabulary size
 
         """
-        B, L = xs.size()
-        time_embed = self.time_embed(time)
+        B, L, _  = xs.size()
+        time_embed = self.time_embed(time) # Shape [B, time_embed_dim]
         seqs_seqlens = segment_sizes.sum(dim=1).type(torch.int32)
-        xs, indices, _, _ = unpad_input(xs.unsqueeze(2), ~get_mask(seqs_seqlens))
-        xs = xs.squeeze(1)
-        h = self.token_embed.forward(xs)
-
+        xs, indices, _, _ = unpad_input(xs, ~get_mask(seqs_seqlens))
+        h = self.project_pt(xs)
+        
         segment_sizes_cpu = segment_sizes.cpu()
         seqs_seqlens_cpu = segment_sizes_cpu.sum(dim=1).type(torch.int32)
         nonzero_segment_sizes_cpu = (
