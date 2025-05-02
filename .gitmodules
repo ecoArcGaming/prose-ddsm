@@ -1,0 +1,3 @@
+[submodule "PoET"]
+	path = PoET
+	url = https://github.com/OpenProteinAI/PoET
