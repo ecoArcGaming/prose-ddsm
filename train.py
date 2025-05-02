@@ -13,15 +13,15 @@ from torch.optim import Adam
 import os
 import numpy as np
 
-# device = 'cuda'
-# model = DiT(n_vocab=8).to(device)
-# xs =  Tensor([[0, 1, 2, 3, 0, 1, 2, 2, 3, 0, 4, 5]]).long().to(device)
-# segment_sizes = Tensor([[4, 5, 3]]).to(device)
-# time = Tensor([1]).to(device)
-# out = model(xs, segment_sizes, time)
-# print(xs.shape)
-# print(out.shape)
-
+device = 'cuda'
+model = DiT(n_vocab=8).to(device)
+xs =  Tensor([[0, 1, 2, 3, 0, 1, 2, 2, 3, 0, 4, 5]]).long().to(device)
+segment_sizes = Tensor([[4, 5, 3]]).to(device)
+time = Tensor([1]).to(device)
+out = model(xs, segment_sizes, time)
+print(xs.shape)
+print(out.shape)
+breakpoint()
 
 class ModelParameters:
     hits_path = 'data/hits.pkl'
