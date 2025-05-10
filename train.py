@@ -13,15 +13,7 @@ from torch.optim import Adam
 import os
 import numpy as np
 
-# device = 'cuda'
-# model = DiT(n_vocab=8).to(device)
-# xs =  Tensor([[0, 1, 2, 3, 0, 1, 2, 2, 3, 0, 4, 5]]).long().to(device)
-# segment_sizes = Tensor([[4, 5, 3]]).to(device)
-# time = Tensor([1]).to(device)
-# out = model(xs, segment_sizes, time)
-# print(xs.shape)
-# print(out.shape)
-# breakpoint()
+torch.autograd.set_detect_anomaly(True)
 
 class ModelParameters:
     hits_path = 'data/hits.pkl'
@@ -36,7 +28,7 @@ class ModelParameters:
     ncat = 7
     num_epochs = 200
     lr = 5e-4
-    max_len = 8000
+    max_len = 50
     padding_idx = -100
     output_dir = '.'
 
@@ -112,7 +104,8 @@ for batch in tqdm.tqdm(dataloader, desc="Stage 1 Weights"):
     tokens = batch["tokens"].to(device) # Shape: [B, L]
     # print(tokens.shape) # torch.Size([2, 7992])
     B, L = tokens.shape
-    
+    # print(batch)
+    # breakpoint()
     padding_mask = (tokens == config.padding_idx) # Shape [B, L], True where padded
     tokens_safe = tokens.clone()
     tokens_safe[padding_mask] = 0 
@@ -131,7 +124,7 @@ for batch in tqdm.tqdm(dataloader, desc="Stage 1 Weights"):
     )
     perturbed_x = perturbed_x.to(device)
     perturbed_x_grad = perturbed_x_grad.to(device)
-
+   
     # Calculate contribution to weights (using stick-breaking space)
     if config.random_order:
             raise NotImplementedError("Random order logic needs careful implementation matching gx_to_gv")
@@ -177,13 +170,12 @@ plt.close()
 print("--- Stage 2: Training DiT Score Model ---")
 # Instantiate your actual DiT model here
 score_model = DiT(config.ncat)
-# Apply DataParallel if using multiple GPUs
-# score_model = nn.DataParallel(score_model)
 score_model = score_model.to(device)
 
 optimizer = Adam(score_model.parameters(), lr=config.lr)
 timepoints = timepoints.to(device)
-tqdm_epoch = tqdm.trange(config.num_epochs, desc="Epochs")
+tqdm_epoch = tqdm.trange(config.num_epochs, desc="Epochs")\
+
 for epoch in tqdm_epoch:
     score_model.train()
     avg_loss = 0.
@@ -195,10 +187,14 @@ for epoch in tqdm_epoch:
         segment_sizes = batch["segment_sizes"].to(device) # Shape: [B, N]
         # labels = batch["labels"].to(device) # Labels might not be needed for DDSM training itself
         B, L = tokens.shape
+        # print(tokens, segment_sizes)
+        current_padding_mask = (tokens == config.padding_idx)
+        current_tokens_safe = tokens.clone()
+        current_tokens_safe[current_padding_mask] = 0 # Use a safe index for padding
 
-        x_one_hot = F.one_hot(tokens_safe, num_classes=config.ncat).float() # Shape: [B, L, V]
-        x_one_hot.masked_fill_(padding_mask.unsqueeze(-1), 0.0)
-        x_one_hot = x_one_hot[..., :config.ncat]
+        # Convert tokens to one-hot encoding for the CURRENT batch
+        x_one_hot = F.one_hot(current_tokens_safe, num_classes=config.ncat).float()
+        x_one_hot.masked_fill_(current_padding_mask.unsqueeze(-1), 0.0)
         # Sample random time indices (potentially importance sampled)
         random_t_idx = torch.randint(0, config.n_time_steps, (B,), device=device) # Discrete indices
 
@@ -206,17 +202,17 @@ for epoch in tqdm_epoch:
         perturbed_x, perturbed_x_grad = diffusion_factory(
             x_one_hot.cpu(), random_t_idx.cpu(), v_one, v_zero, v_one_loggrad, v_zero_loggrad, alpha, beta
         )
+
         perturbed_x = perturbed_x.to(device) # Shape [B, L, V] (distribution)
         perturbed_x_grad = perturbed_x_grad.to(device) # Shape [B, L, V] (true score)
 
         # Get continuous time points for the model
         random_timepoints = timepoints[random_t_idx].to(device) # Shape [B]
-
-        # torch.Size([2, 7998, 7]) torch.Size([2, 574]) torch.Size([2])
+        
+        print(f"  Min: {perturbed_x.min()}, Max: {perturbed_x.max()}")
         # --- Model Forward Pass ---
         # Pass the noisy distribution, segment sizes, and continuous time
-        predicted_score = score_model(perturbed_x, segment_sizes, random_timepoints) # Output: [B, L, V]
-
+        predicted_score = score_model(perturbed_x, segment_sizes, random_timepoints) # Output: [B, L, V] # NAN
         # --- Calculate DDSM Loss ---
         if config.random_order:
                 raise NotImplementedError("Random order logic needs careful implementation matching gx_to_gv")
@@ -225,9 +221,9 @@ for epoch in tqdm_epoch:
             perturbed_v = sb._inverse(perturbed_x, prevent_nan=True).detach() # [B, L, V-1]
             pred_grad_v = gx_to_gv(predicted_score, perturbed_x, create_graph=True) # [B, L, V-1]
             true_grad_v = gx_to_gv(perturbed_x_grad, perturbed_x) # [B, L, V-1]
-
         # Get loss weights for the sampled times
         current_loss_weights = (1.0 / time_loss_weights_sqrt)[random_t_idx] # Shape [B]
+        # print("LOSS NAN", current_loss_weights.isnan().any()) # false
         # Expand weights for broadcasting: [B, 1, 1]
         current_loss_weights = current_loss_weights.view(B, 1, 1)
 
@@ -236,14 +232,14 @@ for epoch in tqdm_epoch:
             s_weights = 2 / (torch.ones(config.ncat - 1, device=device) + torch.arange(config.ncat - 1, 0, -1, device=device).float())
         else:
             s_weights = torch.ones(config.ncat - 1, device=device)
-
+        # print("S NAN", s_weights.isnan().any()) # false
         # Calculate weighted squared error in v-space
         loss_term = current_loss_weights * s_weights * perturbed_v * (1 - perturbed_v) * (pred_grad_v - true_grad_v)**2
 
         # --- Apply Masking to Loss ---
         # Create mask based on actual sequence lengths (False where valid, True where padded)
         seq_lengths = segment_sizes.sum(dim=1).long()
-        mask = torch.arange(L, device=device)[None, :] >= seq_lengths[:, None] # Shape [B, L]
+        mask = torch.arange(loss_term.shape[1], device=device)[None, :] >= seq_lengths[:, None] # Shape [B, L]
         # Expand mask for the V-1 dimension: [B, L, V-1]
         mask_expanded = mask.unsqueeze(-1).expand(-1, -1, config.ncat - 1)
         # Zero out loss terms for padded positions
@@ -254,7 +250,7 @@ for epoch in tqdm_epoch:
         total_loss_batch = loss_term_masked.sum()
         num_valid_elements = (~mask_expanded).sum()
         loss = total_loss_batch / num_valid_elements if num_valid_elements > 0 else torch.tensor(0.0, device=device)
-
+        print(loss)
         # --- Optimization Step ---
         optimizer.zero_grad()
         loss.backward()

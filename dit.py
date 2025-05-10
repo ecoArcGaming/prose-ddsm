@@ -443,10 +443,10 @@ class DiTTieredTransformerEncoderLayer(nn.Module):
         Here, attn_self and attn may be None depending on the value of
         return_attention.
         """
-        fn = self.forward_padded
-        if type(x) is PackedTensorSequences:
-            assert seqs_cu_seqlens is not None
-            fn = self.forward_packed
+        # fn = self.forward_padded
+        # if type(x) is PackedTensorSequences:
+        #     assert seqs_cu_seqlens is not None
+        fn = self.forward_packed
         return fn(
             x=x,
             timestep_embedding=timestep_embedding,
@@ -681,12 +681,16 @@ class DiT(PoET):
         """
         B, L, _  = xs.size()
         time_embed = self.time_embed(time) # Shape [B, time_embed_dim]
+        
         seqs_seqlens = segment_sizes.sum(dim=1).type(torch.int32)
+        # print(xs, seqs_seqlens)
         xs, indices, _, _ = unpad_input(xs, ~get_mask(seqs_seqlens))
         h = self.project_pt(xs)
         
         segment_sizes_cpu = segment_sizes.cpu()
         seqs_seqlens_cpu = segment_sizes_cpu.sum(dim=1).type(torch.int32)
+    
+
         nonzero_segment_sizes_cpu = (
             segment_sizes_cpu[segment_sizes_cpu > 0].flatten().type(torch.int32)
         )

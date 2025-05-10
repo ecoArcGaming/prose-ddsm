@@ -20,8 +20,8 @@ class ATCG(Alphabet):
 
     def __init__(
         self,
-        mask=True,
-        include_gap=True,
+        mask=False,
+        include_gap=False,
         include_startstop=True,
         distinct_startstop=True,
     ):
@@ -376,7 +376,7 @@ class PromoterDataset(Dataset):
         max_seq_length,
         padding_idx=IGNORE_INDEX,
         reverse_sequence=False,
-        skip_padding=True,
+        skip_padding=False,
     ):
         """
         Packs a single sample's query and passages into a single sequence, using Uniprot21 tokenization.
