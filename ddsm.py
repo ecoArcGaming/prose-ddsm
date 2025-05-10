@@ -245,15 +245,18 @@ class UnitStickBreakingTransform(Transform):
 
     def log_abs_det_jacobian(self, x, y=None):
         # log det of the inverse transform
+        eps = 1e-6
         detJ = -(
-                (1 - x).log() * torch.arange(x.shape[-1] - 1, -1, -1, device=x.device)
+                torch.clamp(1.0 - x, min=eps).log() * torch.arange(x.shape[-1] - 1, -1, -1, device=x.device)
         ).sum(-1)
         return detJ
 
     def log_abs_det_jacobian_forward(self, x, y=None):
         # log det of the forward transform
+        eps = 1e-6
+        
         detJ = (
-                (1 - x).log() * torch.arange(x.shape[-1] - 1, -1, -1, device=x.device)
+                torch.clamp(1.0 - x, min=eps).log() * torch.arange(x.shape[-1] - 1, -1, -1, device=x.device)
         ).sum(-1)
         return detJ
 

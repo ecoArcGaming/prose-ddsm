@@ -209,23 +209,31 @@ for epoch in tqdm_epoch:
         # Get continuous time points for the model
         random_timepoints = timepoints[random_t_idx].to(device) # Shape [B]
         
-        print(f"  Min: {perturbed_x.min()}, Max: {perturbed_x.max()}")
+        # print(f"  Min: {perturbed_x.min()}, Max: {perturbed_x.max()}")
         # --- Model Forward Pass ---
         # Pass the noisy distribution, segment sizes, and continuous time
         predicted_score = score_model(perturbed_x, segment_sizes, random_timepoints) # Output: [B, L, V] # NAN
         # --- Calculate DDSM Loss ---
+        # print("logit:", predicted_score.isnan().any(), predicted_score.isinf().any())
+        
         if config.random_order:
                 raise NotImplementedError("Random order logic needs careful implementation matching gx_to_gv")
         else:
             # Transform gradients to stick-breaking space
             perturbed_v = sb._inverse(perturbed_x, prevent_nan=True).detach() # [B, L, V-1]
+            # print("perturbed_v:", perturbed_v.isnan().any(), perturbed_v.isinf().any())
+
             pred_grad_v = gx_to_gv(predicted_score, perturbed_x, create_graph=True) # [B, L, V-1]
+            # print("pred_v:", pred_grad_v.isnan().any(),pred_grad_v.isinf().any())
+        
             true_grad_v = gx_to_gv(perturbed_x_grad, perturbed_x) # [B, L, V-1]
+            # print("tru_v:", true_grad_v.isnan().any(),true_grad_v.isinf().any())
+
         # Get loss weights for the sampled times
-        current_loss_weights = (1.0 / time_loss_weights_sqrt)[random_t_idx] # Shape [B]
-        # print("LOSS NAN", current_loss_weights.isnan().any()) # false
-        # Expand weights for broadcasting: [B, 1, 1]
-        current_loss_weights = current_loss_weights.view(B, 1, 1)
+        # current_loss_weights = (1.0 / time_loss_weights_sqrt)[random_t_idx] # Shape [B]
+        # print("LOSS NAN", current_loss_weights.isnan().any(),current_loss_weights.isinf().any()) # false
+        # # Expand weights for broadcasting: [B, 1, 1]
+        # current_loss_weights = current_loss_weights.view(B, 1, 1)
 
         # Speed balancing factor
         if config.speed_balanced:
@@ -234,7 +242,8 @@ for epoch in tqdm_epoch:
             s_weights = torch.ones(config.ncat - 1, device=device)
         # print("S NAN", s_weights.isnan().any()) # false
         # Calculate weighted squared error in v-space
-        loss_term = current_loss_weights * s_weights * perturbed_v * (1 - perturbed_v) * (pred_grad_v - true_grad_v)**2
+        # loss_term = current_loss_weights * s_weights * perturbed_v * (1 - perturbed_v) * (pred_grad_v - true_grad_v)**2
+        loss_term = s_weights * perturbed_v * (1 - perturbed_v) * (pred_grad_v - true_grad_v)**2
 
         # --- Apply Masking to Loss ---
         # Create mask based on actual sequence lengths (False where valid, True where padded)
@@ -250,7 +259,6 @@ for epoch in tqdm_epoch:
         total_loss_batch = loss_term_masked.sum()
         num_valid_elements = (~mask_expanded).sum()
         loss = total_loss_batch / num_valid_elements if num_valid_elements > 0 else torch.tensor(0.0, device=device)
-        print(loss)
         # --- Optimization Step ---
         optimizer.zero_grad()
         loss.backward()
@@ -258,6 +266,7 @@ for epoch in tqdm_epoch:
 
         avg_loss += loss.item() * B # Use weighted average if batch sizes vary?
         num_items += B
+        
 
     epoch_end_time = time.time()
     avg_loss /= num_items
