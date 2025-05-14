@@ -1,1 +1,4 @@
-steps400.cat2.time4.0.samples10000.pth
+preprocessing/
+__pycache__/
+slurm/
+wandb/

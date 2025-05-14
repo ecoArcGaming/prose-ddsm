@@ -4,6 +4,7 @@ import torch
 from data import PromoterDataset, ATCG
 import pickle 
 from torch.utils.data import DataLoader
+from torch.optim.lr_scheduler import LambdaLR # Added
 import matplotlib.pyplot as plt
 import time
 import tqdm 
@@ -12,69 +13,46 @@ import torch.nn.functional as F
 from torch.optim import Adam
 import os
 import numpy as np
+import wandb
 
 torch.autograd.set_detect_anomaly(True)
 
 class ModelParameters:
-    hits_path = 'data/hits.pkl'
-    query_path = 'data/query.pkl'
-    weights_file = '/home/erik/ddsm/steps400.cat2.time4.0.samples10000.pth'
+    hits_path = '/n/groups/marks/users/erik/Promoter_Poet_private/data/hits.pkl'
+    query_path = '/n/groups/marks/users/erik/Promoter_Poet_private/data/query.pkl'
+    weights_file = '/n/groups/marks/users/erik/prose-ddsm/preprocessing/steps400.cat7.time4.0.samples100000.pth'
     device = 'cuda'
-    batch_size = 2
+    batch_size = 4
     num_workers = 1
     n_time_steps = 400
     random_order = False
     speed_balanced = True
     ncat = 7
-    num_epochs = 200
-    lr = 5e-4
-    max_len = 50
+    num_epochs = 10
+    lr = 1e-4
+    max_len = 16384
     padding_idx = -100
-    output_dir = '.'
+    output_dir = '/model'
+    wandb_project = 'diffusion-prose'
+    warmup_steps = 1000
+    total_training_steps = None
+    preprocess_steps = 10000
+
 
 config = ModelParameters()
 alphabet = ATCG()
+run = wandb.init(
+    project=config.wandb_project,  # Specify your project
+)
 
-# with open(config.hits_path, "rb") as f:
-#     hits = pickle.load(f)
+with open(config.hits_path, "rb") as f:
+    hits = pickle.load(f)
 
-# with open(config.query_path, "rb") as f:
-#     query = pickle.load(f)
+with open(config.query_path, "rb") as f:
+    query = pickle.load(f)
 
-h = {
-        "OXKSZ": {"ACAGAGTAACTGC", "CACGCAAGCGACTA", "GGGCGGGTAGTACCC"},
-        "GHXGF": {"AAAATGGTCTGTC", "AATAAGTGAG", "CGCGACGCCATAGTT"},
-        "XSVNO": {"CCGATCCCGCCCGC", "GCGGGCCGGCATGCC", "TTTAGTTGTGTT"},
-        "LPTSW": {"ATTGCTGGACA", "GCAGTGCCAGTTTC", "GTCATCGTGCACAT"},
-        "SAPJM": {"AGAGGTACCC", "CGGGTGAAATT", "CTGGTCACGAGTT"},
-        "KNGBV": {"AGCACGCACG", "GAGCGTATCGCAGC"},
-        "YTWYS": {"AATGCAACTGGTT", "ATGAAATTATT", "GTACAGACCC"},
-        "IMXVE": {
-            "TAGTGCAACC",
-            "TGAGACGGACGAT",
-        },
-        "QDKFG": {"CAGGTTTGGCCTGT", "CCCAGTTACCA", "GTTTGACTGC"},
-        "GDLYH": {"AACGACAAGCATG", "TACCCGAGTGTAT", "TGGGATCTCA"},
-        "XQIRL": {"CACGTGGCGCCGCTT", "CCGTTTTATTG", "GTCCTTACATGCCCC"},
-        "BSKUP": {"GAGCCTCTTGCG", "GAGCGTATCGCAGC"},
-    }
-q = {
-    "OXKSZ": "ACAGAGTAACTGC",
-    "GHXGF": "AAAATGGTCTGTC",
-    "XSVNO": "CCGATCCCGCCCGC",
-    "LPTSW": "ATTGCTGGACA",
-    "SAPJM": "CTGGTCACGAGTT",
-    "KNGBV": "CGGGTAGTTGCGAAC",
-    "YTWYS": "GTACAGACCC",
-    "IMXVE": "TAGTGCAACC",
-    "QDKFG": "GTTTGACTGC",
-    "GDLYH": "TGGGATCTCA",
-    "XQIRL": "GTCCTTACATGCCCC",
-    "BSKUP": "TCGACGAATG",
-}
-
-dataset = PromoterDataset(sequences=h,
-                          queries=q,
+dataset = PromoterDataset(sequences=hits,
+                          queries=query,
                           alphabet=alphabet,
                           max_length = config.max_len)
 dataloader = DataLoader(dataset, 
@@ -84,20 +62,21 @@ dataloader = DataLoader(dataset,
                         collate_fn=dataset.padded_collate_packed)
 
 v_one, v_zero, v_one_loggrad, v_zero_loggrad, timepoints = torch.load(config.weights_file)
-v_one = v_one.cpu().expand(-1, -1,config.ncat - 1 )
-v_zero = v_zero.cpu().expand(-1, -1,config.ncat - 1 )
-v_one_loggrad = v_one_loggrad.cpu().expand(-1, -1,config.ncat - 1 )
-v_zero_loggrad = v_zero_loggrad.cpu().expand(-1, -1,config.ncat - 1 )
+v_one = v_one.cpu()
+v_zero = v_zero.cpu()
+v_one_loggrad = v_one_loggrad.cpu()
+v_zero_loggrad = v_zero_loggrad.cpu()
 timepoints = timepoints.cpu()
 alpha = torch.ones(config.ncat - 1).float()
 beta =  torch.arange(config.ncat - 1, 0, -1).float()
-device = "cuda"
+device = config.device
 sb = UnitStickBreakingTransform()
 
 print("--- Stage 1: Calculating Time-Dependent Weights ---")
 time_dependent_cums = torch.zeros(config.n_time_steps).to(device)
 time_dependent_counts = torch.zeros(config.n_time_steps).to(device)
 num_items_stage1 = 0
+
 
 # with torch.no_grad(): # No gradients needed for weight calculation
 for batch in tqdm.tqdm(dataloader, desc="Stage 1 Weights"):
@@ -116,23 +95,22 @@ for batch in tqdm.tqdm(dataloader, desc="Stage 1 Weights"):
     x_one_hot = x_one_hot[..., :config.ncat]
     # Sample random time indices
     random_t_idx = torch.randint(0, config.n_time_steps, (B,), device=device) # Discrete indices
-    # print(x_one_hot.shape, random_t_idx.shape, alpha.shape, v_zero.shape) 
-    # torch.Size([2, 7998, 7]) torch.Size([2]) torch.Size([6]),  torch.Size([10000, 400, 1])
     
-    perturbed_x, perturbed_x_grad = diffusion_factory(
-        x_one_hot.cpu(), random_t_idx.cpu(), v_one, v_zero, v_one_loggrad, v_zero_loggrad, alpha, beta
-    )
+    # perturbed_x, perturbed_x_grad = diffusion_factory(
+    #     x_one_hot.cpu(), random_t_idx.cpu(), v_one, v_zero, v_one_loggrad, v_zero_loggrad, alpha, beta
+    # )
+    perturbed_x, perturbed_x_grad = diffusion_fast_flatdirichlet(x_one_hot.cpu(), random_t_idx.cpu(), v_one, v_one_loggrad, )
     perturbed_x = perturbed_x.to(device)
     perturbed_x_grad = perturbed_x_grad.to(device)
    
     # Calculate contribution to weights (using stick-breaking space)
     if config.random_order:
-            raise NotImplementedError("Random order logic needs careful implementation matching gx_to_gv")
+        raise NotImplementedError("TODO")
     else:
         perturbed_v = sb._inverse(perturbed_x, prevent_nan=True) # Shape [B, L, V-1]
         grad_v = gx_to_gv(perturbed_x_grad, perturbed_x) # Shape [B, L, V-1]
 
-    # Weighting factor (from original script)
+    # Weighting factor 
     if config.speed_balanced:
         s_weights = 2 / (torch.ones(config.ncat - 1, device=device) + torch.arange(config.ncat - 1, 0, -1, device=device).float())
     else:
@@ -140,6 +118,10 @@ for batch in tqdm.tqdm(dataloader, desc="Stage 1 Weights"):
 
     # Calculate squared magnitude in v-space, weighted
     variance_term = (perturbed_v * (1 - perturbed_v) * s_weights * grad_v**2) # Shape [B, L, V-1]
+    padding_mask_expanded = padding_mask.unsqueeze(-1).to(variance_term.device) # Shape [B, L, 1]
+    
+    # Zero out variance_term at padded positions
+    variance_term = variance_term.masked_fill(padding_mask_expanded, 0.0)
 
     # Average over sequence length and V-1 dimensions, sum contributions per time index
     batch_variances = variance_term.sum(dim=[1, 2]) # Sum over L and V-1 -> Shape [B]
@@ -149,12 +131,15 @@ for batch in tqdm.tqdm(dataloader, desc="Stage 1 Weights"):
     time_dependent_counts.scatter_add_(0, random_t_idx, torch.ones_like(random_t_idx, dtype=torch.float))
     num_items_stage1 += B
 
+    if num_items_stage1 > config.preprocess_steps:
+        break
+
 # Avoid division by zero for time steps that were not sampled
 time_dependent_counts[time_dependent_counts == 0] = 1
 time_dependent_weights = time_dependent_cums / time_dependent_counts
 # Normalize weights
 time_dependent_weights = time_dependent_weights / time_dependent_weights.mean()
-# Use sqrt as in the original script's ScoreNet init and loss calculation
+
 time_loss_weights_sqrt = torch.sqrt(time_dependent_weights).detach() # Shape [n_time_steps]
 
 print("Finished calculating time weights.")
@@ -171,10 +156,28 @@ print("--- Stage 2: Training DiT Score Model ---")
 # Instantiate your actual DiT model here
 score_model = DiT(config.ncat)
 score_model = score_model.to(device)
+if config.total_training_steps is None:
+    config.total_training_steps = config.num_epochs * len(dataloader)
+    print(f"Calculated total_training_steps: {config.total_training_steps}")
+
+# --- Learning Rate Scheduler Function ---
+def get_lr_scheduler_lambda(warmup_steps, total_training_steps, base_lr):
+    def lr_lambda(current_step):
+        if current_step < warmup_steps:
+            # Linear warmup
+            return float(current_step) / float(max(1, warmup_steps))
+        # Linear decay after warmup
+        progress = float(current_step - warmup_steps) / float(max(1, total_training_steps - warmup_steps))
+        return max(0.0, 1.0 - progress) # Decay to 0
+    return lr_lambda
 
 optimizer = Adam(score_model.parameters(), lr=config.lr)
+
+lr_scheduler_func = get_lr_scheduler_lambda(config.warmup_steps, config.total_training_steps, config.lr)
+scheduler = LambdaLR(optimizer, lr_lambda=lr_scheduler_func)
 timepoints = timepoints.to(device)
-tqdm_epoch = tqdm.trange(config.num_epochs, desc="Epochs")\
+tqdm_epoch = tqdm.trange(config.num_epochs, desc="Epochs")
+
 
 for epoch in tqdm_epoch:
     score_model.train()
@@ -199,9 +202,11 @@ for epoch in tqdm_epoch:
         random_t_idx = torch.randint(0, config.n_time_steps, (B,), device=device) # Discrete indices
 
         # Apply forward diffusion
-        perturbed_x, perturbed_x_grad = diffusion_factory(
-            x_one_hot.cpu(), random_t_idx.cpu(), v_one, v_zero, v_one_loggrad, v_zero_loggrad, alpha, beta
-        )
+        # perturbed_x, perturbed_x_grad = diffusion_factory(
+        #     x_one_hot.cpu(), random_t_idx.cpu(), v_one, v_zero, v_one_loggrad, v_zero_loggrad, alpha, beta
+        # )
+        perturbed_x, perturbed_x_grad = diffusion_fast_flatdirichlet(
+            x_one_hot.cpu(), random_t_idx.cpu(), v_one, v_one_loggrad)
 
         perturbed_x = perturbed_x.to(device) # Shape [B, L, V] (distribution)
         perturbed_x_grad = perturbed_x_grad.to(device) # Shape [B, L, V] (true score)
@@ -209,12 +214,10 @@ for epoch in tqdm_epoch:
         # Get continuous time points for the model
         random_timepoints = timepoints[random_t_idx].to(device) # Shape [B]
         
-        # print(f"  Min: {perturbed_x.min()}, Max: {perturbed_x.max()}")
         # --- Model Forward Pass ---
         # Pass the noisy distribution, segment sizes, and continuous time
         predicted_score = score_model(perturbed_x, segment_sizes, random_timepoints) # Output: [B, L, V] # NAN
         # --- Calculate DDSM Loss ---
-        # print("logit:", predicted_score.isnan().any(), predicted_score.isinf().any())
         
         if config.random_order:
                 raise NotImplementedError("Random order logic needs careful implementation matching gx_to_gv")
@@ -230,10 +233,9 @@ for epoch in tqdm_epoch:
             # print("tru_v:", true_grad_v.isnan().any(),true_grad_v.isinf().any())
 
         # Get loss weights for the sampled times
-        # current_loss_weights = (1.0 / time_loss_weights_sqrt)[random_t_idx] # Shape [B]
-        # print("LOSS NAN", current_loss_weights.isnan().any(),current_loss_weights.isinf().any()) # false
+        current_loss_weights = (1.0 / time_loss_weights_sqrt)[random_t_idx] # Shape [B]
         # # Expand weights for broadcasting: [B, 1, 1]
-        # current_loss_weights = current_loss_weights.view(B, 1, 1)
+        current_loss_weights = current_loss_weights.view(B, 1, 1)
 
         # Speed balancing factor
         if config.speed_balanced:
@@ -242,8 +244,8 @@ for epoch in tqdm_epoch:
             s_weights = torch.ones(config.ncat - 1, device=device)
         # print("S NAN", s_weights.isnan().any()) # false
         # Calculate weighted squared error in v-space
-        # loss_term = current_loss_weights * s_weights * perturbed_v * (1 - perturbed_v) * (pred_grad_v - true_grad_v)**2
-        loss_term = s_weights * perturbed_v * (1 - perturbed_v) * (pred_grad_v - true_grad_v)**2
+        loss_term = current_loss_weights * s_weights * perturbed_v * (1 - perturbed_v) * (pred_grad_v - true_grad_v)**2
+        # loss_term = s_weights * perturbed_v * (1 - perturbed_v) * (pred_grad_v - true_grad_v)**2
 
         # --- Apply Masking to Loss ---
         # Create mask based on actual sequence lengths (False where valid, True where padded)
@@ -260,9 +262,15 @@ for epoch in tqdm_epoch:
         num_valid_elements = (~mask_expanded).sum()
         loss = total_loss_batch / num_valid_elements if num_valid_elements > 0 else torch.tensor(0.0, device=device)
         # --- Optimization Step ---
+        torch.nn.utils.clip_grad_norm_(score_model.parameters(), max_norm=1.0) # Adjust max_norm as needed
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
+        scheduler.step()
+        current_lr = scheduler.get_last_lr()[0]
+
+        wandb.log({"loss": loss.item(), "lr": current_lr})
+
 
         avg_loss += loss.item() * B # Use weighted average if batch sizes vary?
         num_items += B
