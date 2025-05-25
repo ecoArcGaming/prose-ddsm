@@ -94,7 +94,7 @@ def sample_cond_prob_path(args, seq, alphabet_size):
     tokens_safe[padding_mask] = 0
     
     # Convert to one-hot
-    seq_one_hot = F.one_hot(tokens_safe, num_classes=alphabet_size).float()
+    seq_one_hot = F.one_hot(tokens_safe, num_classes=args.ncat).float()
     seq_one_hot.masked_fill_(padding_mask.unsqueeze(-1), 0.0)
     if args.mode == 'dirichlet':
         alphas = torch.from_numpy(1 + scipy.stats.expon().rvs(size=B) * args.alpha_scale).to(seq.device).float()

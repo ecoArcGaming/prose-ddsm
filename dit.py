@@ -643,11 +643,11 @@ class DiT(PoET):
             num_layers=num_layers,
         )
         self.time_embed = nn.Sequential(GaussianFourierProjection(embed_dim=time_embed_dim),
-                                   nn.Linear(time_embed_dim, time_embed_dim), GELU())
+                                   nn.Linear(time_embed_dim, time_embed_dim), GELU(), nn.Linear(time_embed_dim, time_embed_dim))
         if norm:
             self.norm = AdaLayerNorm(hidden_dim, time_embed_dim)
 
-        self.project_pt = nn.Linear(n_vocab, hidden_dim)
+        self.project_pt = nn.Linear(n_vocab * 2, hidden_dim) # 2 * n_vocab for flow matching
     
     def forward(self, xs: torch.Tensor, segment_sizes: torch.Tensor, time: torch.Tensor) -> torch.Tensor:
         """

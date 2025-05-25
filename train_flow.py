@@ -22,22 +22,18 @@ torch.autograd.set_detect_anomaly(True)
 class ModelParameters:
     hits_path = '/n/groups/marks/users/erik/Promoter_Poet_private/data/hits.pkl'
     query_path = '/n/groups/marks/users/erik/Promoter_Poet_private/data/query.pkl'
-    weights_file = '/n/groups/marks/users/erik/prose-ddsm/preprocessing/steps400.cat7.time4.0.samples100000.pth'
     device = 'cuda'
     batch_size = 4
     num_workers = 1
-    n_time_steps = 400
     ncat = 7
     num_epochs = 10
-    lr = 1e-4
+    lr = 5e-4
     max_len = 16384
     padding_idx = -100
     output_dir = '/n/groups/marks/users/erik/prose-ddsm/models'
     wandb_project = 'diffusion-prose-flow'
     warmup_steps = 1000
     total_training_steps = None
-    preprocess_steps = 10000
-    
     mode = 'dirichlet'  # 'dirichlet', 'riemannian', 'ardm', 'lrar'
     alpha_max = 100.0
     prior_pseudocount = 0.1
@@ -76,7 +72,7 @@ condflow = DirichletConditionalFlow(K=config.ncat)
 device = config.device
 
 # Initialize model
-flow_model = DiT(n_vocab=config.ncat * 2)
+flow_model = DiT(n_vocab=config.ncat)
 flow_model = flow_model.to(device)
 
 if config.total_training_steps is None:
@@ -160,15 +156,6 @@ for epoch in tqdm_epoch:
         segment_sizes = batch["segment_sizes"].to(device)
         B, L = tokens.shape
         
-        # Handle padding
-        padding_mask = (tokens == config.padding_idx)
-        tokens_safe = tokens.clone()
-        tokens_safe[padding_mask] = 0
-        
-        # Convert to one-hot
-        seq_one_hot = F.one_hot(tokens_safe, num_classes=config.ncat).float()
-        seq_one_hot.masked_fill_(padding_mask.unsqueeze(-1), 0.0)
-        
         # Sample flow trajectory
         if config.mode == 'dirichlet':
             xt, alphas, prior_weights = sample_flow_trajectory(
@@ -176,23 +163,16 @@ for epoch in tqdm_epoch:
             )
         else:
             raise NotImplementedError
-        # print(xt.shape, alphas.shape, segment_sizes.shape)
-        # torch.Size([4, 16384, 14]) torch.Size([4]) torch.Size([4, 18]) 
+       
         # Forward pass through model
         logits = flow_model(xt, segment_sizes, alphas)
         
         # For flow-based modes, use cross-entropy loss against ground truth
-        target_seq = tokens_safe
-        losses = F.cross_entropy(logits.transpose(1, 2), target_seq, reduction='none')
-    
-        # Apply masking
-        seq_lengths = segment_sizes.sum(dim=1).long()
-        mask = torch.arange(losses.shape[1], device=device)[None, :] >= seq_lengths[:, None]
-        losses = losses.masked_fill(mask, 0.0)
-        
-        # Calculate mean loss over non-padded elements
-        num_valid_elements = (~mask).sum()
-        loss = losses.sum() / num_valid_elements if num_valid_elements > 0 else torch.tensor(0.0, device=device)
+        # target_seq = tokens_safe
+        loss = F.cross_entropy(logits.transpose(1, 2), 
+                                 tokens, reduction='mean',  
+                                 ignore_index=config.padding_idx)
+
         
         # Optimization step
         optimizer.zero_grad()
@@ -245,7 +225,7 @@ for epoch in tqdm_epoch:
             seq_pred = torch.argmax(logits_pred, dim=-1)
             
             # Calculate validation metrics
-            val_loss = F.cross_entropy(logits_pred.transpose(1, 2), tokens_safe, reduction='none')
+            val_loss = F.cross_entropy(logits_pred.transpose(1, 2), tokens_safe, reduction='none', ignore_index=config.padding_idx)
             seq_lengths = segment_sizes.sum(dim=1).long()
             mask = torch.arange(val_loss.shape[1], device=device)[None, :] >= seq_lengths[:, None]
             val_loss = val_loss.masked_fill(mask, 0.0)
