@@ -1,6 +1,5 @@
 import copy
 from typing import Optional, Tuple, TypeVar, Union
-
 import torch
 import torch.nn as nn
 import torch.utils.checkpoint as checkpoint
@@ -12,14 +11,20 @@ from PoET.poet.models.modules.packed_sequence import PackedTensorSequences
 from ddsm import *
 from PoET.poet.models.poet import PoET
 from PoET.poet.models.modules.transformer_rotary import RotaryFlashMultiheadAttention
-
+import math
 from PoET.poet.models.modules.packed_sequence import (
     PackedTensorSequences,
     get_mask,
     pad_input,
     unpad_input,
 )
-
+class GELU(nn.Module):
+    """
+    Implementation of the GELU activation function currently in Google BERT repo (identical to OpenAI GPT).
+    Reference: Gaussian Error Linear Units (GELU) paper: https://arxiv.org/abs/1606.08415
+    """
+    def forward(self, x):
+        return 0.5 * x * (1.0 + torch.tanh(math.sqrt(2.0 / math.pi) * (x + 0.044715 * torch.pow(x, 3.0))))
 
 T = TypeVar("T", Tensor, PackedTensorSequences)
 
@@ -46,34 +51,27 @@ class AdaLayerNorm(nn.Module):
                                 Shape: [B, time_embed_dim], where B is the batch size.
             seqs_cu_seqlens: Cumulative sequence lengths for the batch.
                              Shape: [B+1]. Should start with 0 and end with packed_len.
-                             Must be on the same device as x.
 
         Returns:
             Normalized and scaled/shifted tensor. Shape: [packed_len, dim].
         """
-      
 
-        # 1. Calculate scale and shift factors for the entire batch
         # scale_shift_params has shape [B, dim * 2]
         scale_shift_params = self.scale_shift(timestep_embedding)
         # scale and shift both have shape [B, dim]
         scale, shift = scale_shift_params.chunk(2, dim=1)
 
-        # 2. Calculate lengths of each sequence in the batch
-        # lengths will have shape [B]
+        # shape [B]
         lengths = seqs_cu_seqlens[1:] - seqs_cu_seqlens[:-1] # Equivalent to seqs_cu_seqlens.diff()
 
-        # 3. Expand scale and shift to match the packed sequence length
         # Use repeat_interleave to repeat each batch item's scale/shift 'length' times
         # scale_gathered and shift_gathered will have shape [packed_len, dim]
         scale_gathered = scale.repeat_interleave(lengths, dim=0)
         shift_gathered = shift.repeat_interleave(lengths, dim=0)
 
-        # 4. Apply Layer Normalization to the input x
         # x_norm has shape [packed_len, dim]
         x_norm = self.norm(x)
 
-        # 5. Apply the gathered scale and shift factors
         # Using the formula: output = x_norm * (1 + scale) + shift
         output = x_norm * (1 + scale_gathered) + shift_gathered
 
@@ -645,7 +643,7 @@ class DiT(PoET):
             num_layers=num_layers,
         )
         self.time_embed = nn.Sequential(GaussianFourierProjection(embed_dim=time_embed_dim),
-                                   nn.Linear(time_embed_dim, time_embed_dim))
+                                   nn.Linear(time_embed_dim, time_embed_dim), GELU())
         if norm:
             self.norm = AdaLayerNorm(hidden_dim, time_embed_dim)
 
