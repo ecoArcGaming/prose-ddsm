@@ -32,7 +32,7 @@ class ModelParameters:
     lr = 1e-4
     max_len = 16384
     padding_idx = -100
-    output_dir = '/model'
+    output_dir = '/n/groups/marks/users/erik/prose-ddsm/models'
     wandb_project = 'diffusion-prose'
     warmup_steps = 1000
     total_training_steps = None
