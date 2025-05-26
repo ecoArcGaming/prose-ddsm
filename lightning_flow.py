@@ -1,5 +1,5 @@
 import lightning.pytorch as pl
-from lightning.pytorchcallbacks import ModelCheckpoint, LearningRateMonitor
+from lightning.pytorch.callbacks import ModelCheckpoint, LearningRateMonitor
 from lightning.pytorch.loggers import WandbLogger
 import torch
 import torch.nn.functional as F
@@ -80,6 +80,8 @@ class FlowMatchingModule(pl.LightningModule):
     @torch.no_grad()
     def dirichlet_flow_inference(self, seq, segment_sizes, alpha_max, num_integration_steps, prior_pseudocount, flow_temp):
         """Dirichlet flow inference for validation"""
+        model_dtype = next(self.flow_model.parameters()).dtype
+
         B, L = seq.shape
         alphabet_size = self.config.ncat
         
@@ -94,7 +96,7 @@ class FlowMatchingModule(pl.LightningModule):
             prior_weight = prior_pseudocount / (s + prior_pseudocount - 1)
             seq_xt = torch.cat([xt * (1 - prior_weight), xt * prior_weight], -1)
             
-            logits = self.flow_model(seq_xt, segment_sizes, s[None].expand(B))
+            logits = self.flow_model(seq_xt.to(dtype=model_dtype), segment_sizes.to(dtype=model_dtype), s[None].expand(B).to(dtype=model_dtype))
             out_probs = torch.nn.functional.softmax(logits / flow_temp, -1)
             
             c_factor = self.condflow.c_factor(xt.cpu().numpy(), s.item())
@@ -108,11 +110,76 @@ class FlowMatchingModule(pl.LightningModule):
             flow = (out_probs.unsqueeze(-2) * cond_flows).sum(-1)
             xt = xt + flow * (t - s)
             
-            if not torch.allclose(xt.sum(2), torch.ones((B, L), device=xt.device), atol=1e-4) or not (xt >= 0).all():
+            if not torch.allclose(xt.sum(2), torch.ones((B, L), device=xt.device, dtype=xt.dtype), atol=1e-4) or not (xt >= 0).all():
                 print(f'WARNING: xt.min(): {xt.min()}. Projecting to simplex.')
                 xt = simplex_proj(xt)
         
         return logits, x0
+    
+    @torch.no_grad()
+    def inpaint_last_sequence(self, partial_seq, segment_sizes, alpha_max, 
+                                     num_integration_steps, prior_pseudocount, flow_temp):
+        """
+        Generate the last segment of a sequence-of-sequences (RePaint approach).
+        
+        Args:
+            partial_seq: [B, L] - sequence with some positions to be filled
+            segment_sizes: [B, num_segments] - segment information
+        """
+        model_dtype = next(self.flow_model.parameters()).dtype
+        device = partial_seq.device
+        
+        B, L = partial_seq.shape
+        alphabet_size = self.config.ncat
+        
+        # Convert known parts to one-hot
+        eye = torch.eye(alphabet_size, device=device, dtype=model_dtype)
+        known_probs = eye[partial_seq.long()]  # [B, L, alphabet_size]
+        
+        # Start from Dirichlet prior
+        xt = torch.distributions.Dirichlet(
+            torch.ones(B, L, alphabet_size, device=device, dtype=model_dtype)
+        ).sample()
+    
+        # start_indices_last_segment[b] = sum of lengths of segments 0 to N-2 for batch item b.
+        start_indices_last_segment = segment_sizes[:, :-1].sum(dim=1) # Shape: [B]
+        indices_matrix = torch.arange(L, device=device).expand(B, -1) # Shape: [B, L]
+        mask = indices_matrix >= start_indices_last_segment.unsqueeze(1)
+        
+        # Replace known positions with their true values
+        mask_expanded = mask.unsqueeze(-1).float()  # [B, L, 1]
+        xt = mask_expanded * xt + (1 - mask_expanded) * known_probs
+        
+        t_span = torch.linspace(1, alpha_max, num_integration_steps, device=device, dtype=model_dtype)
+        
+        for i, (s, t) in enumerate(zip(t_span[:-1], t_span[1:])):
+            prior_weight = torch.tensor(prior_pseudocount / (s + prior_pseudocount - 1), 
+                                      device=device, dtype=model_dtype)
+            
+            seq_xt = torch.cat([xt * (1 - prior_weight), xt * prior_weight], -1)
+            time_tensor = s.unsqueeze(0).expand(B).to(dtype=model_dtype)
+            
+            logits = self.flow_model(seq_xt, segment_sizes, time_tensor)
+            out_probs = torch.nn.functional.softmax(logits / flow_temp, -1)
+            
+            # Compute flow
+            c_factor = self.condflow.c_factor(xt.cpu().numpy(), s.item())
+            c_factor = torch.from_numpy(c_factor).to(device=device, dtype=model_dtype)
+            
+            if torch.isnan(c_factor).any():
+                c_factor = torch.nan_to_num(c_factor)
+            
+            cond_flows = (eye - xt.unsqueeze(-1)) * c_factor.unsqueeze(-2)
+            flow = (out_probs.unsqueeze(-2) * cond_flows).sum(-1)
+            xt_new = xt + flow * (t - s)
+            
+            # Only update masked positions, keep known positions fixed
+            xt = mask_expanded * xt_new + (1 - mask_expanded) * known_probs
+            
+            if not torch.allclose(xt.sum(2), torch.ones((B, L), device=device, dtype=model_dtype), atol=1e-4) or not (xt >= 0).all():
+                xt = simplex_proj(xt)
+        
+        return logits, xt
     
     def training_step(self, batch, batch_idx):
         tokens = batch["tokens"]
@@ -287,7 +354,8 @@ def main():
         mode='min',
         save_top_k=3,
         save_last=True,
-        every_n_epochs=1
+        every_n_epochs=1,  # Save checkpoint every epoch
+        save_on_train_epoch_end=True  # Save at end of each epoch
     )
     
     lr_monitor = LearningRateMonitor(logging_interval='step')
@@ -301,7 +369,7 @@ def main():
         callbacks=[checkpoint_callback, lr_monitor],
         gradient_clip_val=1.0,
         log_every_n_steps=1,
-        val_check_interval=1.0,  # Validate every epoch
+        val_check_interval=100,
         enable_progress_bar=True,
         enable_model_summary=True
     )
