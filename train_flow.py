@@ -23,12 +23,12 @@ class ModelParameters:
     hits_path = '/n/groups/marks/users/erik/Promoter_Poet_private/data/hits.pkl'
     query_path = '/n/groups/marks/users/erik/Promoter_Poet_private/data/query.pkl'
     device = 'cuda'
-    batch_size = 4
+    batch_size = 8
     num_workers = 1
     ncat = 7
     num_epochs = 10
-    lr = 5e-4
-    max_len = 16384
+    lr = 1e-4
+    max_len = 8192
     padding_idx = -100
     output_dir = '/n/groups/marks/users/erik/prose-ddsm/models'
     wandb_project = 'diffusion-prose-flow'
@@ -39,7 +39,7 @@ class ModelParameters:
     prior_pseudocount = 0.1
     flow_temp = 1.0
     num_integration_steps = 50
-    validate = False
+    validate = True
     alpha_scale = 2.0
     fix_alpha = None
 
@@ -57,15 +57,23 @@ with open(config.hits_path, "rb") as f:
 with open(config.query_path, "rb") as f:
     query = pickle.load(f)
 
-dataset = PromoterDataset(sequences=hits,
-                          queries=query,
-                          alphabet=alphabet,
-                          max_length=config.max_len)
-dataloader = DataLoader(dataset, 
+train_seq, train_query, val_seq, val_query = (
+        PromoterDataset._train_validation_split(19, hits, query)
+    )
+
+train_dataset = PromoterDataset(train_seq, train_query, alphabet, config.max_len)
+val_dataset = PromoterDataset(val_seq, val_query, alphabet, config.max_len)
+
+train_dataloader = DataLoader(train_dataset, 
                         batch_size=config.batch_size, 
                         shuffle=True, 
                         num_workers=config.num_workers,
-                        collate_fn=dataset.padded_collate_packed)
+                        collate_fn=train_dataset.padded_collate_packed)
+val_dataloader = DataLoader(train_dataset, 
+                        batch_size=config.batch_size, 
+                        shuffle=False, 
+                        num_workers=config.num_workers,
+                        collate_fn=val_dataset.padded_collate_packed)
 
 # Initialize conditional flow
 condflow = DirichletConditionalFlow(K=config.ncat)
@@ -76,7 +84,7 @@ flow_model = DiT(n_vocab=config.ncat)
 flow_model = flow_model.to(device)
 
 if config.total_training_steps is None:
-    config.total_training_steps = config.num_epochs * len(dataloader)
+    config.total_training_steps = config.num_epochs * len(train_dataloader)
     print(f"Calculated total_training_steps: {config.total_training_steps}")
 
 # Learning rate scheduler
@@ -89,13 +97,12 @@ def get_lr_scheduler_lambda(warmup_steps, total_training_steps, base_lr):
     return lr_lambda
 
 optimizer = Adam(flow_model.parameters(), lr=config.lr)
-# lr_scheduler_func = get_lr_scheduler_lambda(config.warmup_steps, config.total_training_steps, config.lr)
-# scheduler = LambdaLR(optimizer, lr_lambda=lr_scheduler_func)
+lr_scheduler_func = get_lr_scheduler_lambda(config.warmup_steps, config.total_training_steps, config.lr)
+scheduler = LambdaLR(optimizer, lr_lambda=lr_scheduler_func)
 
 # utilities
 def sample_flow_trajectory(seq, mode, alphabet_size, alpha_max, prior_pseudocount):
     """Sample flow trajectory for training"""
-    B, L = seq.shape
     
     if mode == 'dirichlet':
         xt, alphas = sample_cond_prob_path(config, seq, alphabet_size)
@@ -151,7 +158,7 @@ for epoch in tqdm_epoch:
     num_items = 0
     epoch_start_time = time.time()
     
-    for batch_idx, batch in enumerate(tqdm.tqdm(dataloader, desc="Training Batch", leave=False)):
+    for batch_idx, batch in enumerate(tqdm.tqdm(train_dataloader, desc="Training Batch", leave=False)):
         tokens = batch["tokens"].to(device)
         segment_sizes = batch["segment_sizes"].to(device)
         B, L = tokens.shape
@@ -164,25 +171,23 @@ for epoch in tqdm_epoch:
         else:
             raise NotImplementedError
        
-        # Forward pass through model
         logits = flow_model(xt, segment_sizes, alphas)
         
-        # For flow-based modes, use cross-entropy loss against ground truth
-        # target_seq = tokens_safe
+        # cross-entropy loss against ground truth
         loss = F.cross_entropy(logits.transpose(1, 2), 
                                  tokens, reduction='mean',  
                                  ignore_index=config.padding_idx)
 
-        
         # Optimization step
         optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(flow_model.parameters(), max_norm=1.0)
+
         optimizer.step()
-        
+        scheduler.step()
         wandb.log({
             "loss": loss.item(), 
-            "alpha_mean": alphas.mean().item() if isinstance(alphas, torch.Tensor) else 0.0
+            "alpha_mean": alphas.mean().item() 
         })
         
         avg_loss += loss.item() * B
@@ -193,51 +198,69 @@ for epoch in tqdm_epoch:
     tqdm_epoch.set_description(f'Epoch {epoch+1}/{config.num_epochs} | Avg Loss: {avg_loss:.5f} | Time: {epoch_end_time - epoch_start_time:.2f}s')
     
     # Validation step
-    if (epoch + 1) % 5 == 0 and config.validate:
+    if (epoch + 1) % 1 == 0 and config.validate:
         flow_model.eval()
         val_losses = []
         val_recoveries = []
         
         print(f"Epoch {epoch+1}: Running validation...")
         
-        for val_batch_idx, val_batch in enumerate(tqdm.tqdm(dataloader, desc="Validation", leave=False)):
-            if val_batch_idx >= 10:  # Limit validation batches
-                break
+        with torch.no_grad():  # Add no_grad context for validation
+            for val_batch_idx, val_batch in enumerate(tqdm.tqdm(val_dataloader, desc="Validation", leave=False)):
+                if val_batch_idx >= 10:  # Limit validation batches
+                    break
+                    
+                tokens = val_batch["tokens"].to(device)
+                segment_sizes = val_batch["segment_sizes"].to(device)
+                B, L = tokens.shape
                 
-            tokens = val_batch["tokens"].to(device)
-            segment_sizes = val_batch["segment_sizes"].to(device)
-            B, L = tokens.shape
-            
-            padding_mask = (tokens == config.padding_idx)
-            tokens_safe = tokens.clone()
-            tokens_safe[padding_mask] = 0
-            
-            # Generate predictions using flow inference
-            if config.mode == 'dirichlet':
-                logits_pred, _ = dirichlet_flow_inference(
-                    flow_model, tokens_safe, segment_sizes, config.alpha_max, 
-                    config.num_integration_steps, condflow, config.prior_pseudocount, config.flow_temp
+                # Create padding mask
+                padding_mask = (tokens == config.padding_idx)
+                tokens_safe = tokens.clone()
+                tokens_safe[padding_mask] = 0
+                
+                # Generate predictions using flow inference
+                if config.mode == 'dirichlet':
+                    logits_pred, _ = dirichlet_flow_inference(
+                        flow_model, tokens_safe, segment_sizes, config.alpha_max, 
+                        config.num_integration_steps, condflow, config.prior_pseudocount, config.flow_temp
+                    )
+                else:
+                    raise NotImplementedError
+                
+                seq_pred = torch.argmax(logits_pred, dim=-1)
+                
+                # Calculate validation loss - only on non-padded tokens
+                val_loss = F.cross_entropy(
+                    logits_pred.transpose(1, 2), 
+                    tokens, 
+                    reduction='mean',  # Changed to 'none' to get per-token losses
+                    ignore_index=config.padding_idx
                 )
-            
-            else:
-                raise NotImplementedError
-            
-            seq_pred = torch.argmax(logits_pred, dim=-1)
-            
-            # Calculate validation metrics
-            val_loss = F.cross_entropy(logits_pred.transpose(1, 2), tokens_safe, reduction='none', ignore_index=config.padding_idx)
-            seq_lengths = segment_sizes.sum(dim=1).long()
-            mask = torch.arange(val_loss.shape[1], device=device)[None, :] >= seq_lengths[:, None]
-            val_loss = val_loss.masked_fill(mask, 0.0)
-            val_losses.append(val_loss.sum() / (~mask).sum())
-            
-            # Calculate recovery rate
-            recovery = seq_pred.eq(tokens_safe).float()
-            recovery = recovery.masked_fill(mask, 0.0)
-            val_recoveries.append(recovery.sum() / (~mask).sum())
+                
+                # Create sequence length mask
+                seq_lengths = segment_sizes.sum(dim=1).long()
+                length_mask = torch.arange(L, device=device)[None, :] < seq_lengths[:, None]
+                
+                # Apply mask and calculate mean loss
+                val_losses.append(val_loss.item())
+                
+                # Calculate recovery rate - only on valid (non-padded) tokens
+                recovery = seq_pred.eq(tokens).float()
+                valid_recovery = recovery[length_mask & ~padding_mask]
+                if valid_recovery.numel() > 0:
+                    val_recoveries.append(valid_recovery.mean())
         
-        avg_val_loss = torch.stack(val_losses).mean().item()
-        avg_val_recovery = torch.stack(val_recoveries).mean().item()
+        # Calculate averages
+        if val_losses:
+            avg_val_loss = torch.stack(val_losses).mean().item()
+        else:
+            avg_val_loss = float('inf')
+            
+        if val_recoveries:
+            avg_val_recovery = torch.stack(val_recoveries).mean().item()
+        else:
+            avg_val_recovery = 0.0
         
         wandb.log({
             "val_loss": avg_val_loss,
@@ -249,12 +272,12 @@ for epoch in tqdm_epoch:
         flow_model.train()
     
     # Save checkpoint
-    if (epoch + 1) % 10 == 0:
+    if (epoch + 1) % 1 == 0:
         save_path = os.path.join(config.output_dir, f"dit_flow_epoch_{epoch+1}.pth")
         torch.save({
             'model_state_dict': flow_model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
-            # 'scheduler_state_dict': scheduler.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict(),
             'epoch': epoch + 1,
             'config': config.__dict__
         }, save_path)
